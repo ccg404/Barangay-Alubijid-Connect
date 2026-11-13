@@ -1,9 +1,14 @@
 "use strict";
 
-const STORAGE_KEY = "barangay-connect-state-v1";
-const TAX_RATE = 0.02;
-const EARLY_DISCOUNT_RATE = 0.1;
-const LATE_PENALTY_RATE = 0.02;
+import {
+  AS_OF_DATE,
+  calculateTax,
+  effectiveBillStatus,
+  markBillingRecordPaid,
+  outstandingBillingRecords,
+} from "./billing.mjs";
+import { createPortalStateStore } from "./portal-state.mjs";
+
 const REPORT_STATUSES = [
   "Submitted",
   "Acknowledged",
@@ -17,8 +22,6 @@ const REPORT_CATEGORIES = [
   "Drainage",
   "Safety",
 ];
-const AS_OF_DATE = "2026-09-24";
-
 const seedData = {
   households: [
     {
@@ -181,8 +184,23 @@ const seedData = {
       answer:
         "The regular assembly is scheduled for October 15, 2026 at 2:00 PM in the covered court.",
       answeredBy: "Ana Villanueva",
+      answeredAt: "2026-09-19",
       upvotes: 8,
       createdAt: "2026-09-18",
+      comments: [
+        {
+          id: "c1",
+          householdId: "h1",
+          text: "Thanks for the info!",
+          createdAt: "2026-09-19",
+        },
+        {
+          id: "c2",
+          householdId: "h3",
+          text: "Will there be snacks?",
+          createdAt: "2026-09-19",
+        },
+      ],
     },
     {
       id: "q2",
@@ -192,59 +210,26 @@ const seedData = {
       answeredBy: "",
       upvotes: 3,
       createdAt: "2026-09-20",
+      comments: [],
     },
   ],
 };
 
-let state = loadState();
+const stateStore = createPortalStateStore(
+  {
+    getItem: (key) => window.localStorage.getItem(key),
+    setItem: (key, value) => window.localStorage.setItem(key, value),
+  },
+  seedData,
+);
+let state;
 let session = { user: null, view: "home" };
 let toastTimer;
 
-function clone(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-function loadState() {
-  try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (stored && stored.version === 1 && Array.isArray(stored.households)) {
-      const waterBills = Array.isArray(stored.waterBills)
-        ? stored.waterBills
-        : clone(seedData.waterBills);
-      return {
-        ...clone(seedData),
-        ...stored,
-        waterBills: waterBills.map((bill) =>
-          bill.status === "Paid" ? bill : { ...bill, status: "Overdue" },
-        ),
-        propertyTaxes: Array.isArray(stored.propertyTaxes)
-          ? stored.propertyTaxes
-          : clone(seedData.propertyTaxes),
-        reports: Array.isArray(stored.reports)
-          ? stored.reports
-          : clone(seedData.reports),
-        questions: Array.isArray(stored.questions)
-          ? stored.questions
-          : clone(seedData.questions),
-      };
-    }
-  } catch (error) {
-    /* fall back to seed data */
-  }
-  return { version: 1, ...clone(seedData) };
-}
-function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-}
 function dateAtNoon(value) {
   if (value instanceof Date) return new Date(value);
   const text = String(value);
   return new Date(/T/.test(text) ? text : `${text}T12:00:00`);
-}
-function getToday() {
-  return dateAtNoon(AS_OF_DATE);
-}
-function isBeforeOrOn(today, date) {
-  return dateAtNoon(today) <= dateAtNoon(date);
 }
 function money(value) {
   return `₱${Number(value).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -285,58 +270,38 @@ function isStaff() {
 function currentHousehold() {
   return householdFor(session.user?.id);
 }
-function effectiveBillStatus(bill) {
-  if (bill.status === "Paid") return "Paid";
-  return "Overdue";
-}
-function outstandingBillingRecords() {
-  return [
-    ...state.waterBills
-      .filter((bill) => bill.status !== "Paid")
-      .map((record) => ({ type: "water", record })),
-    ...state.propertyTaxes
-      .filter((record) => record.status !== "Paid")
-      .map((record) => ({ type: "tax", record })),
-  ];
+
+function getUserUpvotes() {
+  try {
+    const stored = localStorage.getItem(`upvotes_${session.user?.id}`);
+    return stored ? JSON.parse(stored) : [];
+  } catch {
+    return [];
+  }
 }
 
-function calculateTax(tax, today = getToday()) {
-  today = dateAtNoon(today);
-  const base = Number(tax.assessedValue) * TAX_RATE;
-  if (tax.status === "Paid") {
-    const discount = Number(tax.discountApplied) || 0;
-    const penalty = Number(tax.penaltyAccrued) || 0;
-    const paidAmount = Number(tax.amountDue);
-    return {
-      base,
-      discount,
-      penalty,
-      total: Number.isFinite(paidAmount)
-        ? paidAmount
-        : Math.max(0, base - discount + penalty),
-    };
+function setUserUpvotes(upvotes) {
+  try {
+    localStorage.setItem(`upvotes_${session.user?.id}`, JSON.stringify(upvotes));
+  } catch {
+    // Ignore storage errors
   }
-  let discount = 0;
-  let penalty = 0;
-  const discountDeadline = new Date(`${tax.year}-10-31T12:00:00`);
-  const dueDate = new Date(`${tax.dueDate}T12:00:00`);
-  if (isBeforeOrOn(today, discountDeadline))
-    discount = base * EARLY_DISCOUNT_RATE;
-  if (today > dueDate) {
-    const overdueMonths = Math.max(
-      1,
-      Math.ceil((today - dueDate) / (30.44 * 24 * 60 * 60 * 1000)),
-    );
-    penalty = base * LATE_PENALTY_RATE * overdueMonths;
-  }
-  return {
-    base,
-    discount,
-    penalty,
-    total: Math.max(0, base - discount + penalty),
-  };
 }
 
+function hasUserUpvoted(questionId) {
+  return getUserUpvotes().includes(questionId);
+}
+
+function toggleUserUpvote(questionId) {
+  const upvotes = getUserUpvotes();
+  const index = upvotes.indexOf(questionId);
+  if (index >= 0) {
+    upvotes.splice(index, 1);
+  } else {
+    upvotes.push(questionId);
+  }
+  setUserUpvotes(upvotes);
+}
 function statusTone(status) {
   return (
     {
@@ -402,8 +367,8 @@ function handleLogin(event) {
     error.hidden = false;
     return;
   }
+  if (!commitState(state)) return;
   session = { user, view: "home" };
-  saveState();
   renderPortal();
 }
 
@@ -469,9 +434,43 @@ function residentView(view) {
     <div class="card-body">${waterBillSummary(bills)}${taxSummary(state.propertyTaxes.filter((tax) => tax.householdId === session.user.id))}</div>
     </section>`;
   if (view === "reports")
-    return `<section class="card" id="reports"><div class="card-header"><div><h2>My reports</h2><p>Track the progress of concerns you submitted.</p></div><button class="button compact" type="button" data-action="toggle-report-form">+ Report an issue</button></div><div class="card-body"><div class="inline-form" id="report-form" hidden><h3>Tell us what is happening</h3><form id="issue-form" class="form-stack" novalidate><div class="field"><label for="report-title">Title</label><input id="report-title" name="title" maxlength="90" placeholder="For example, pothole near the school" required></div><div class="field"><label for="report-description">Description</label><textarea id="report-description" name="description" maxlength="1000" placeholder="What should our team know?" required></textarea></div><div class="field"><label for="report-location">Location</label><input id="report-location" name="location" maxlength="140" placeholder="Street, landmark, or nearby house number" required></div><div class="field"><label for="report-category">Category</label><select id="report-category" name="category" required><option value="">Choose a category</option>${REPORT_CATEGORIES.map((category) => `<option value="${category}">${category}</option>`).join("")}</select></div><p class="form-error" id="report-error" role="alert" hidden></p><div class="form-actions"><button class="button" type="submit">Send report</button><button class="button secondary" type="button" data-action="hide-report-form">Cancel</button></div></form></div><div class="report-list" id="report-list">${renderResidentReports(reports)}</div></div></section>`;
-  if (view === "questions")
-    return `<section class="card" id="questions"><div class="card-header"><div><h2>Community Q&A</h2><p>Ask the barangay a question. Staff answers appear here for everyone to see.</p></div><button class="button compact" type="button" data-action="toggle-question-form">+ Ask a question</button></div><div class="card-body"><div class="inline-form" id="question-form" hidden><h3>Ask the barangay</h3><form id="qa-form" class="form-stack" novalidate><div class="field"><label for="question-input">Your question</label><textarea id="question-input" name="question" maxlength="500" placeholder="Keep it clear and specific so staff can help." required></textarea></div><p class="form-error" id="question-error" role="alert" hidden></p><div class="form-actions"><button class="button" type="submit">Post question</button><button class="button secondary" type="button" data-action="hide-question-form">Cancel</button></div></form></div><div class="list" id="qa-list">${renderQuestions(questions)}</div></div></section>`;
+    return `<section class="card" id="reports"><div class="card-header"><div><h2>My reports</h2><p>Track the progress of concerns you submitted.</p></div><button class="button compact" type="button" data-action="toggle-report-form">+ Report an issue</button></div><div class="card-body"><div class="inline-form" id="report-form" hidden><h3>Tell us what is happening</h3><form id="issue-form" class="form-stack" novalidate><div class="field"><label for="report-title">Title</label><input id="report-title" name="title" maxlength="90" placeholder="For example, pothole near the school" required></div><div class="field"><label for="report-description">Description</label><textarea id="report-description" name="description" maxlength="1000" placeholder="What should our team know?" required></textarea></div><div class="field"><label for="report-location">Location</label><input id="report-location" name="location" maxlength="140" placeholder="Street, landmark, or nearby house number" required></div><div class="field"><label for="report-category">Category</label><select id="report-category" name="category" required><option value="">Choose a category</option>${REPORT_CATEGORIES.map((category) => `<option value="${category}">${category}</option>`).join("")}</select></div><div class="field"><label for="report-images">Photos (optional)</label><input id="report-images" name="images" type="file" accept="image/*" multiple><p class="field-hint">Add up to 5 photos to help our team understand the issue better.</p><div id="report-image-preview" style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;"></div></div><p class="form-error" id="report-error" role="alert" hidden></p><div class="form-actions"><button class="button" type="submit">Send report</button><button class="button secondary" type="button" data-action="hide-report-form">Cancel</button></div></form></div><div class="report-list" id="report-list">${renderResidentReports(reports)}</div></div></section>`;
+  if (view === "questions") {
+    const totalQuestions = questions.length;
+    const answeredQuestions = questions.filter(q => q.answer).length;
+    const unansweredQuestions = totalQuestions - answeredQuestions;
+    const myQuestions = questions.filter(q => q.householdId === session.user.id).length;
+    
+    return `<section class="card qa-section" id="questions">
+      <div class="card-header qa-header">
+        <div class="qa-header-content">
+          <h2>Community Q&A</h2>
+          <p>Ask the barangay a question. Staff answers appear here for everyone to see.</p>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+          <div class="qa-stats">
+            <span class="qa-stat"><strong>${totalQuestions}</strong> total</span>
+            <span class="qa-stat"><strong>${answeredQuestions}</strong> answered</span>
+            <span class="qa-stat"><strong>${unansweredQuestions}</strong> pending</span>
+          </div>
+          <button class="button compact" type="button" data-action="toggle-question-form">+ Ask a question</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="qa-form-wrapper">
+          <div class="inline-form" id="question-form" hidden>
+            <h3>Ask the barangay</h3>
+            <form id="qa-form" class="form-stack" novalidate>
+              <div class="field"><label for="question-input">Your question</label><textarea id="question-input" name="question" maxlength="500" placeholder="Keep it clear and specific so staff can help." required></textarea></div>
+              <p class="form-error" id="question-error" role="alert" hidden></p>
+              <div class="form-actions"><button class="button" type="submit">Post question</button><button class="button secondary" type="button" data-action="hide-question-form">Cancel</button></div>
+            </form>
+          </div>
+        </div>
+        <div class="qa-list" id="qa-list">${renderQuestions(questions)}</div>
+      </div>
+    </section>`;
+  }
   return `<section class="card" id="home-summary"><div class="card-header"><div><h2>Your account</h2><p>${escapeHtml(householdFor(session.user.id).address)}</p></div></div><div class="card-body"><div class="quick-actions"><button class="quick-action" type="button" data-action="navigate" data-view="bills"><strong>View my bills</strong><span>↗</span></button><button class="quick-action" type="button" data-action="navigate" data-view="reports"><strong>Report an issue</strong><span>＋</span></button><button class="quick-action" type="button" data-action="navigate" data-view="questions"><strong>Ask a question</strong><span>?</span></button><button class="quick-action" type="button" data-action="navigate" data-view="bills"><strong>Payment guidance</strong><span>↗</span></button></div></div></section><section class="card" id="attention"><div class="card-header"><div><h2>Needs attention</h2><p>Only the items that may need a closer look.</p></div></div><div class="card-body">${renderAttention()}</div></section>${waterBillSummary(bills)}${taxSummary(state.propertyTaxes.filter((tax) => tax.householdId === session.user.id))}`;
 }
 
@@ -519,8 +518,17 @@ function renderResidentReports(reports) {
   return [...reports]
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .map(
-      (report) =>
-        `<article class="report-item"><div class="report-top"><h3>${escapeHtml(report.title)}</h3>${badge(report.status)}</div><p class="report-meta">${escapeHtml(report.category)} · ${escapeHtml(report.location)} · ${dateLabel(report.createdAt)}</p><p class="report-description">${escapeHtml(report.description)}</p><button class="detail-toggle" type="button" data-action="toggle-detail" data-detail-id="report-${escapeHtml(report.id)}" aria-expanded="false" aria-controls="report-${escapeHtml(report.id)}-detail">View status timeline</button><div class="detail-panel" id="report-${escapeHtml(report.id)}-detail" hidden>${renderTimeline(report)}</div></article>`,
+      (report) => {
+        const imagesHtml = report.images && report.images.length > 0 ? `
+          <div class="report-images" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; margin-top: 12px;">
+            ${report.images.map(img => `
+              <img src="${escapeHtml(img.data)}" alt="${escapeHtml(img.name)}" style="width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--line);" loading="lazy">
+            `).join('')}
+          </div>
+        ` : '';
+        
+        return `<article class="report-item"><div class="report-top"><h3>${escapeHtml(report.title)}</h3>${badge(report.status)}</div><p class="report-meta">${escapeHtml(report.category)} · ${escapeHtml(report.location)} · ${dateLabel(report.createdAt)}</p><p class="report-description">${escapeHtml(report.description)}</p>${imagesHtml}<button class="detail-toggle" type="button" data-action="toggle-detail" data-detail-id="report-${escapeHtml(report.id)}-detail" aria-expanded="false" aria-controls="report-${escapeHtml(report.id)}-detail">View status timeline</button><div class="detail-panel" id="report-${escapeHtml(report.id)}-detail" hidden>${renderTimeline(report)}</div></article>`;
+      }
     )
     .join("");
 }
@@ -530,14 +538,95 @@ function renderTimeline(report) {
 }
 function renderQuestions(questions) {
   if (!questions.length)
-    return '<p class="empty">No community questions yet.</p>';
-  return [...questions]
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map(
-      (question) =>
-        `<article class="qa-card"><div class="qa-q"><strong>Q:</strong> ${escapeHtml(question.question)}</div>${question.answer ? `<div class="qa-a"><strong>A:</strong> ${escapeHtml(question.answer)} <em>(by ${escapeHtml(question.answeredBy)})</em></div>` : '<p class="muted" style="margin:8px 0 0;font-size:12px">Awaiting a staff answer.</p>'}<div class="qa-meta">Asked ${dateLabel(question.createdAt)} · ${question.upvotes} helpful</div></article>`,
-    )
-    .join("");
+    return `<div class="qa-empty">
+      <svg class="qa-empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+      <h3 class="qa-empty-title">No community questions yet</h3>
+      <p class="qa-empty-text">Be the first to ask a question! Your question will be visible to the community and answered by barangay staff.</p>
+      <button class="button qa-empty-action" type="button" data-action="toggle-question-form">+ Ask a question</button>
+    </div>`;
+  
+  const sortedQuestions = [...questions].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const userUpvotes = getUserUpvotes();
+  
+  return sortedQuestions.map((question) => {
+    const isAnswered = !!question.answer;
+    const cardClass = isAnswered ? 'qa-card answered' : 'qa-card unanswered';
+    const isUpvoted = userUpvotes.includes(question.id);
+    const upvoteClass = isUpvoted ? 'qa-upvote upvoted' : 'qa-upvote';
+    const asker = householdFor(question.householdId);
+    const askerName = asker ? asker.headName : "Unknown resident";
+    const comments = question.comments || [];
+    
+    const commentsHtml = comments.length > 0 ? `
+      <div class="qa-comments" style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line);">
+        ${comments.map(comment => {
+          const commenter = householdFor(comment.householdId);
+          const commenterName = commenter ? commenter.headName : "Unknown resident";
+          return `
+            <div class="qa-comment-item" style="display: flex; gap: 10px; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line);">
+              <div class="avatar" style="width: 32px; height: 32px; font-size: 11px; flex-shrink: 0;">${escapeHtml(initials(commenterName))}</div>
+              <div style="flex: 1; min-width: 0;">
+                <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                  <span style="font-weight: 600; font-size: 13px;">${escapeHtml(commenterName)}</span>
+                  <span style="color: var(--muted); font-size: 11px;">${dateLabel(comment.createdAt)}</span>
+                </div>
+                <p style="margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink);">${escapeHtml(comment.text)}</p>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    ` : '';
+    
+    return `<article class="${cardClass}" data-question-id="${escapeHtml(question.id)}">
+      <div class="qa-question">
+        <span class="qa-question-label" aria-hidden="true">Q</span>
+        <div class="qa-question-body">
+          <div class="qa-author-row">
+            <span class="qa-question-author">${escapeHtml(askerName)}</span>
+            <span class="qa-dot-sep">·</span>
+            <span class="qa-question-date">${dateLabel(question.createdAt)}</span>
+          </div>
+          <p class="qa-question-text">${escapeHtml(question.question)}</p>
+        </div>
+      </div>
+      ${isAnswered ? `
+        <div class="qa-answer">
+          <span class="qa-answer-label" aria-hidden="true">A</span>
+          <div class="qa-answer-content">
+            <div class="qa-author-row">
+              <span class="qa-answer-author">${escapeHtml(question.answeredBy)}</span>
+              <span class="qa-dot-sep">·</span>
+              <span class="qa-answer-date">${dateLabel(question.answeredAt || question.createdAt)}</span>
+            </div>
+            <p class="qa-answer-text">${escapeHtml(question.answer)}</p>
+          </div>
+        </div>
+      ` : ``}
+      ${commentsHtml}
+      <div class="qa-meta">
+        <div class="qa-meta-left">
+          <button class="${upvoteClass}" type="button" data-action="upvote-question" data-question-id="${escapeHtml(question.id)}" aria-label="${question.upvotes} people liked this" aria-pressed="${isUpvoted}">
+            <svg viewBox="0 0 24 24" fill="${isUpvoted ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>
+            <span>${question.upvotes}</span>
+          </button>
+          <button class="qa-comment" type="button" data-action="comment-question" data-question-id="${escapeHtml(question.id)}" aria-label="Comment on this question">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+            <span>Comment</span>
+          </button>
+        </div>
+      </div>
+      <form class="qa-comment-form" id="comment-form-${escapeHtml(question.id)}" data-question-id="${escapeHtml(question.id)}" data-action="submit-comment" hidden style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);">
+        <div class="field" style="margin: 0;">
+          <textarea name="comment" placeholder="Write a comment..." rows="2" required style="min-height: 72px;"></textarea>
+        </div>
+        <div class="form-actions" style="justify-content: flex-end; margin-top: 8px;">
+          <button type="button" class="button secondary compact" data-action="hide-comment-form" data-question-id="${escapeHtml(question.id)}">Cancel</button>
+          <button type="submit" class="button compact">Post comment</button>
+        </div>
+      </form>
+    </article>`;
+  }).join("");
 }
 
 function renderStaff() {
@@ -550,7 +639,8 @@ function staffView(view) {
   if (view === "queue") return renderReportQueue();
   if (view === "billing") return renderBillingRecords();
   if (view === "questions") return renderStaffQuestions();
-  return `${renderStats()}<section class="card"><div class="card-header"><div><h2>Today’s work</h2><p>Start with reports that are waiting for a response.</p></div><button class="button compact" type="button" data-action="navigate" data-view="queue">Open report queue</button></div><div class="card-body"><div class="list"><div class="list-row"><div class="list-row-main"><strong>${state.reports.filter((report) => report.status === "Submitted").length} new reports need acknowledgement</strong><p>Submitted reports are shown first.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="queue">Review</button></div><div class="list-row"><div class="list-row-main"><strong>${outstandingBillingRecords().length} outstanding billing record${outstandingBillingRecords().length === 1 ? "" : "s"}</strong><p>Update payment status after off-platform payment is confirmed.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="billing">View records</button></div></div></div></section>`;
+  const outstandingCount = outstandingBillingRecords(state).length;
+  return `${renderStats()}<section class="card"><div class="card-header"><div><h2>Today’s work</h2><p>Start with reports that are waiting for a response.</p></div><button class="button compact" type="button" data-action="navigate" data-view="queue">Open report queue</button></div><div class="card-body"><div class="list"><div class="list-row"><div class="list-row-main"><strong>${state.reports.filter((report) => report.status === "Submitted").length} new reports need acknowledgement</strong><p>Submitted reports are shown first.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="queue">Review</button></div><div class="list-row"><div class="list-row-main"><strong>${outstandingCount} outstanding billing record${outstandingCount === 1 ? "" : "s"}</strong><p>Update payment status after off-platform payment is confirmed.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="billing">View records</button></div></div></div></section>`;
 }
 function renderStats() {
   const weekAgo = new Date("2026-09-17T12:00:00");
@@ -605,7 +695,7 @@ function renderReportRows(filter) {
     .join("");
 }
 function renderBillingRecords() {
-  const records = outstandingBillingRecords();
+  const records = outstandingBillingRecords(state);
   return `<section class="card" id="billing-records"><div class="card-header"><div><h2>Billing records</h2><p>Mark a record paid after confirming payment received elsewhere.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="home">Back to overview</button></div><div class="toolbar"><span class="toolbar-label">${records.length} outstanding record${records.length === 1 ? "" : "s"}</span><div></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Household</th><th>Type</th><th>Period</th><th>Amount due</th><th>Status</th><th>Update status</th></tr></thead><tbody>${renderBillingRows(records)}</tbody></table></div></section>`;
 }
 function renderBillingRows(records) {
@@ -673,38 +763,141 @@ function handleResidentClick(event) {
     return;
   }
   if (action === "hide-report-form") {
-    document.getElementById("report-form").hidden = true;
+    const form = document.getElementById("report-form");
+    if (!form) return;
+    form.hidden = true;
     return;
   }
   if (action === "toggle-question-form") {
     const form = document.getElementById("question-form");
+    if (!form) return;
     form.hidden = !form.hidden;
     if (!form.hidden) form.querySelector("textarea")?.focus();
     return;
   }
   if (action === "hide-question-form") {
-    document.getElementById("question-form").hidden = true;
+    const form = document.getElementById("question-form");
+    if (!form) return;
+    form.hidden = true;
     return;
   }
   if (action === "toggle-detail") {
     const panel = document.getElementById(button.dataset.detailId);
     panel.hidden = !panel.hidden;
     button.setAttribute("aria-expanded", String(!panel.hidden));
+    return;
+  }
+  if (action === "remove-image") {
+    const fileInput = document.getElementById("report-images");
+    const fileName = button.dataset.name;
+    if (fileInput && fileName) {
+      const dt = new DataTransfer();
+      Array.from(fileInput.files).forEach(file => {
+        if (file.name !== fileName) dt.items.add(file);
+      });
+      fileInput.files = dt.files;
+      // Trigger change event to update preview
+      fileInput.dispatchEvent(new Event("change"));
+    }
+    return;
+  }
+  if (action === "upvote-question") {
+    const questionId = button.dataset.questionId;
+    const question = state.questions.find(q => q.id === questionId);
+    if (!question) return;
+    
+    // Toggle upvote with localStorage persistence
+    const isUpvoted = hasUserUpvoted(questionId);
+    toggleUserUpvote(questionId);
+    const newUpvotes = isUpvoted ? question.upvotes - 1 : question.upvotes + 1;
+    
+    const updatedQuestions = state.questions.map(q => 
+      q.id === questionId ? { ...q, upvotes: newUpvotes } : q
+    );
+    
+    if (!commitState({ ...state, questions: updatedQuestions })) return;
+    renderResident();
+    return;
+  }
+  if (action === "comment-question") {
+    const questionId = button.dataset.questionId;
+    const question = state.questions.find(q => q.id === questionId);
+    if (!question) return;
+    
+    // Toggle comment form visibility
+    const commentForm = document.getElementById(`comment-form-${questionId}`);
+    if (commentForm) {
+      commentForm.hidden = !commentForm.hidden;
+      if (!commentForm.hidden) {
+        commentForm.querySelector("textarea")?.focus();
+      }
+    }
+    return;
+  }
+  if (action === "hide-comment-form") {
+    const questionId = button.dataset.questionId;
+    const commentForm = document.getElementById(`comment-form-${questionId}`);
+    if (commentForm) commentForm.hidden = true;
+    return;
   }
 }
 function handleResidentChange(event) {
   if (event.target.matches('[data-action="report-filter"]'))
     session.reportFilter = event.target.value;
+  
+  // Handle image preview for report form
+  if (event.target.id === "report-images") {
+    const fileInput = event.target;
+    const files = Array.from(fileInput.files).slice(0, 5);
+    const previewContainer = document.getElementById("report-image-preview");
+    if (previewContainer) {
+      previewContainer.innerHTML = files.map(file => `
+        <div class="image-preview-item" style="position: relative; width: 100px; height: 100px; flex-shrink: 0;">
+          <img src="${URL.createObjectURL(file)}" alt="${escapeHtml(file.name)}" style="width: 100%; height: 100%; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--line);">
+          <button type="button" class="remove-image" data-name="${escapeHtml(file.name)}" style="position: absolute; top: -8px; right: -8px; width: 24px; height: 24px; border-radius: 50%; background: var(--red); color: white; border: none; cursor: pointer; font-size: 16px; line-height: 1; display: flex; align-items: center; justify-content: center;">×</button>
+        </div>
+      `).join('');
+    }
+  }
 }
 function handleResidentSubmit(event) {
   const form = event.target;
   if (form.id === "issue-form") submitIssue(event);
   if (form.id === "qa-form") submitQuestion(event);
+  if (form.dataset.action === "submit-comment") {
+    event.preventDefault();
+    const questionId = form.dataset.questionId;
+    const question = state.questions.find(q => q.id === questionId);
+    if (!question) return;
+    
+    const commentText = new FormData(form).get("comment")?.toString().trim();
+    if (!commentText) return;
+    
+    const newComment = {
+      id: `c${Date.now()}`,
+      householdId: session.user.id,
+      text: commentText,
+      createdAt: AS_OF_DATE,
+    };
+    
+    const updatedQuestions = state.questions.map(q => {
+      if (q.id === questionId) {
+        const comments = q.comments || [];
+        return { ...q, comments: [...comments, newComment] };
+      }
+      return q;
+    });
+    
+    if (!commitState({ ...state, questions: updatedQuestions })) return;
+    renderResident();
+    return;
+  }
 }
-function submitIssue(event) {
+async function submitIssue(event) {
   event.preventDefault();
   const form = event.target;
-  const values = Object.fromEntries(new FormData(form));
+  const formData = new FormData(form);
+  const values = Object.fromEntries(formData);
   if (
     !values.title?.trim() ||
     !values.description?.trim() ||
@@ -714,6 +907,26 @@ function submitIssue(event) {
     showFormError("report-error", "Please complete each required field.");
     return;
   }
+  
+  // Handle image uploads
+  const imageFiles = formData.getAll("images");
+  const images = [];
+  const maxImages = 5;
+  
+  for (let i = 0; i < Math.min(imageFiles.length, maxImages); i++) {
+    const file = imageFiles[i];
+    if (file && file.type.startsWith("image/")) {
+      // Convert to base64 for storage
+      const base64 = await fileToBase64(file);
+      images.push({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        data: base64,
+      });
+    }
+  }
+  
   const report = {
     id: `r${Date.now()}`,
     householdId: session.user.id,
@@ -724,11 +937,20 @@ function submitIssue(event) {
     status: "Submitted",
     createdAt: AS_OF_DATE,
     updatedAt: AS_OF_DATE,
+    images: images,
   };
-  state.reports.unshift(report);
-  saveState();
+  if (!commitState({ ...state, reports: [report, ...state.reports] })) return;
   renderResident();
   showToast("Report submitted. You can follow its status here.");
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 function submitQuestion(event) {
   event.preventDefault();
@@ -738,7 +960,7 @@ function submitQuestion(event) {
     showFormError("question-error", "Please write your question first.");
     return;
   }
-  state.questions.unshift({
+  const newQuestion = {
     id: `q${Date.now()}`,
     householdId: session.user.id,
     question,
@@ -746,8 +968,9 @@ function submitQuestion(event) {
     answeredBy: "",
     upvotes: 0,
     createdAt: AS_OF_DATE,
-  });
-  saveState();
+  };
+  if (!commitState({ ...state, questions: [newQuestion, ...state.questions] }))
+    return;
   renderResident();
   showToast("Question posted for the barangay team.");
 }
@@ -766,27 +989,22 @@ function handleStaffClick(event) {
   if (paymentButton) {
     if (!window.confirm(paymentButton.dataset.confirm)) return;
     const type = paymentButton.dataset.paymentType;
-    const collection =
-      type === "water"
-        ? state.waterBills
-        : type === "tax"
-          ? state.propertyTaxes
-          : [];
-    const record = collection.find(
-      (item) => item.id === paymentButton.dataset.paymentId,
-    );
-    if (record) {
-      if (type === "tax") {
-        const calculation = calculateTax(record);
-        record.amountDue = calculation.total;
-        record.discountApplied = calculation.discount;
-        record.penaltyAccrued = calculation.penalty;
-      }
-      record.status = "Paid";
-      saveState();
-      renderStaff();
-      showToast(`${type === "water" ? "Water" : "Tax"} record marked as paid.`);
+    let nextState;
+    try {
+      nextState = markBillingRecordPaid(
+        state,
+        type,
+        paymentButton.dataset.paymentId,
+        AS_OF_DATE,
+      );
+    } catch (error) {
+      console.error(error);
+      showToast("Could not update this billing record.", true);
+      return;
     }
+    if (!commitState(nextState)) return;
+    renderStaff();
+    showToast(`${type === "water" ? "Water" : "Tax"} record marked as paid.`);
   }
 }
 function handleStaffChange(event) {
@@ -796,9 +1014,12 @@ function handleStaffChange(event) {
       (item) => item.id === select.dataset.reportStatus,
     );
     if (report) {
-      report.status = select.value;
-      report.updatedAt = AS_OF_DATE;
-      saveState();
+      const reports = state.reports.map((item) =>
+        item.id === report.id
+          ? { ...item, status: select.value, updatedAt: AS_OF_DATE }
+          : item,
+      );
+      if (!commitState({ ...state, reports })) return;
       renderStaff();
       showToast(`Report moved to ${select.value}.`);
     }
@@ -819,9 +1040,12 @@ function handleStaffSubmit(event) {
     (item) => item.id === form.dataset.questionId,
   );
   if (question) {
-    question.answer = answer;
-    question.answeredBy = session.user.name;
-    saveState();
+    const questions = state.questions.map((item) =>
+      item.id === question.id
+        ? { ...item, answer, answeredBy: session.user.name, answeredAt: AS_OF_DATE }
+        : item,
+    );
+    if (!commitState({ ...state, questions })) return;
     renderStaff();
     showToast("Answer posted to the community Q&A.");
   }
@@ -831,15 +1055,38 @@ function showFormError(id, message) {
   element.textContent = message;
   element.hidden = false;
 }
-function showToast(message) {
+function commitState(nextState) {
+  try {
+    state = stateStore.commit(nextState);
+    return true;
+  } catch (error) {
+    console.error(error);
+    showToast("Unable to save changes. Your previous data is unchanged.", true);
+    return false;
+  }
+}
+function showToast(message, isError = false) {
   clearTimeout(toastTimer);
   const element = document.getElementById("toast");
   element.textContent = message;
-  element.classList.remove("error");
+  element.classList.toggle("error", isError);
+  element.setAttribute("role", isError ? "alert" : "status");
+  element.setAttribute("aria-live", isError ? "assertive" : "polite");
   element.hidden = false;
   toastTimer = setTimeout(() => {
     element.hidden = true;
   }, 3600);
 }
 
-renderLogin();
+function renderStateError() {
+  document.title = "Portal data unavailable · Barangay Connect";
+  app.innerHTML = `<main id="main-content" class="page portal-page"><section class="card"><div class="card-header"><div><h1>Portal data unavailable</h1><p role="alert">Saved portal data could not be loaded. It has not been overwritten. Check browser storage or restore valid saved data before retrying.</p></div></div></section></main>`;
+}
+
+try {
+  state = stateStore.load();
+  renderLogin();
+} catch (error) {
+  console.error(error);
+  renderStateError();
+}
