@@ -135,3 +135,106 @@ export function markBillingRecordPaid(state, type, id, today = AS_OF_DATE) {
     ),
   };
 }
+
+/**
+ * Calculate days until due date (negative = overdue)
+ */
+function daysUntilDue(dueDate, today = AS_OF_DATE) {
+  if (!dueDate) return null;
+  const due = dateParts(dueDate);
+  const asOf = dateParts(today);
+  const dueMs = Date.UTC(due.year, due.month - 1, due.day);
+  const asOfMs = Date.UTC(asOf.year, asOf.month - 1, asOf.day);
+  return Math.round((dueMs - asOfMs) / (1000 * 60 * 60 * 24));
+}
+
+/**
+ * Get reminder level for a bill
+ * @returns {Object} { level, days, message }
+ */
+export function billReminder(bill, today = AS_OF_DATE) {
+  if (bill.status === "Paid") {
+    const days = daysUntilDue(bill.dueDate, today);
+    return {
+      level: "paid",
+      days,
+      message: "Paid",
+    };
+  }
+
+  const days = daysUntilDue(bill.dueDate, today);
+  if (days === null) {
+    return {
+      level: "none",
+      days: null,
+      message: "No due date",
+    };
+  }
+
+  if (days < 0) {
+    return {
+      level: "overdue",
+      days,
+      message: `Overdue by ${Math.abs(days)} day${Math.abs(days) !== 1 ? "s" : ""}`,
+    };
+  }
+
+  if (days === 0) {
+    return {
+      level: "due-today",
+      days,
+      message: "Due today",
+    };
+  }
+
+  if (days <= 7) {
+    return {
+      level: "due-soon",
+      days,
+      message: `Due in ${days} day${days !== 1 ? "s" : ""}`,
+    };
+  }
+
+  return {
+    level: "upcoming",
+    days,
+    message: `Due in ${days} days`,
+  };
+}
+
+/**
+ * Get CSS class for reminder level
+ */
+export function billReminderLevel(level) {
+  const classes = {
+    overdue: "bill-overdue",
+    "due-today": "bill-due-today",
+    "due-soon": "bill-due-soon",
+    upcoming: "bill-upcoming",
+    paid: "bill-paid",
+    none: "bill-upcoming",
+  };
+  return classes[level] || classes.upcoming;
+}
+
+/**
+ * Get outstanding billing records with reminder data
+ */
+export function outstandingBillingRecordsWithReminders(state, today = AS_OF_DATE) {
+  return [
+    ...state.waterBills
+      .filter((bill) => bill.status !== "Paid")
+      .map((record) => ({
+        type: "water",
+        record,
+        reminder: billReminder(record, today),
+      })),
+    ...state.propertyTaxes
+      .filter((record) => record.status !== "Paid")
+      .map((record) => ({
+        type: "tax",
+        record,
+        reminder: billReminder(record, today),
+      })),
+  ];
+}

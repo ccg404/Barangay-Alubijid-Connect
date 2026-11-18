@@ -1,13 +1,408 @@
 "use strict";
 
+console.log('script.js module executing');
+
 import {
   AS_OF_DATE,
   calculateTax,
   effectiveBillStatus,
   markBillingRecordPaid,
   outstandingBillingRecords,
+  billReminder,
+  billReminderLevel,
+  outstandingBillingRecordsWithReminders,
 } from "./billing.mjs";
 import { createPortalStateStore } from "./portal-state.mjs";
+
+// ===== Phase 1: Loading & Error State Utilities =====
+let loadingOverlayTimer = null;
+let toastQueue = [];
+let isToastShowing = false;
+
+// ===== Phase 1: Offline Caching & Background Sync =====
+let swRegistration = null;
+let isOnline = navigator.onLine;
+const pendingMutations = [];
+
+async function registerServiceWorker() {
+  if ('serviceWorker' in navigator) {
+    try {
+      swRegistration = await navigator.serviceWorker.register('/sw.js');
+      console.log('Service Worker registered:', swRegistration.scope);
+
+      // Listen for messages from SW
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.data.type === 'mutation-synced') {
+          handleMutationSynced(event.data);
+        }
+      });
+
+      // Check for updates periodically
+      setInterval(() => swRegistration.update(), 60000);
+    } catch (error) {
+      console.warn('Service Worker registration failed:', error);
+    }
+  }
+}
+
+function setupOnlineOfflineHandlers() {
+  window.addEventListener('online', () => {
+    isOnline = true;
+    showToast('Back online. Syncing changes…', false);
+    syncPendingMutations();
+    updateStaleIndicator();
+  });
+
+  window.addEventListener('offline', () => {
+    isOnline = false;
+    showToast('You are offline. Changes will sync when reconnected.', true);
+    updateStaleIndicator();
+  });
+}
+
+function queueMutation(mutation) {
+  pendingMutations.push({
+    ...mutation,
+    id: Date.now(),
+    timestamp: Date.now(),
+  });
+
+  // Store in IndexedDB via SW
+  if (swRegistration && swRegistration.active) {
+    swRegistration.active.postMessage({
+      type: 'queue-mutation',
+      mutation: {
+        url: mutation.url,
+        method: mutation.method,
+        headers: mutation.headers,
+        body: mutation.body,
+      },
+    });
+  }
+
+  // Also store locally for immediate retry
+  savePendingMutations();
+}
+
+async function syncPendingMutations() {
+  if (!isOnline || pendingMutations.length === 0) return;
+
+  const mutations = [...pendingMutations];
+  for (const mutation of mutations) {
+    try {
+      const response = await fetch(mutation.url, {
+        method: mutation.method,
+        headers: mutation.headers,
+        body: mutation.body,
+      });
+
+      if (response.ok) {
+        removePendingMutation(mutation.id);
+        showToast('Changes synced', false);
+      }
+    } catch (error) {
+      console.log('Sync failed, will retry:', error);
+      break; // Stop on first failure, retry later
+    }
+  }
+}
+
+function removePendingMutation(id) {
+  const index = pendingMutations.findIndex((m) => m.id === id);
+  if (index !== -1) {
+    pendingMutations.splice(index, 1);
+    savePendingMutations();
+  }
+}
+
+function savePendingMutations() {
+  try {
+    localStorage.setItem('pendingMutations', JSON.stringify(pendingMutations));
+  } catch (e) {
+    console.warn('Failed to save pending mutations:', e);
+  }
+}
+
+function loadPendingMutations() {
+  try {
+    const stored = localStorage.getItem('pendingMutations');
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      pendingMutations.push(...parsed);
+    }
+  } catch (e) {
+    console.warn('Failed to load pending mutations:', e);
+  }
+}
+
+function handleMutationSynced(data) {
+  if (data.success) {
+    // Remove from local queue
+    const index = pendingMutations.findIndex((m) => m.id === data.mutationId);
+    if (index !== -1) {
+      pendingMutations.splice(index, 1);
+      savePendingMutations();
+    }
+  }
+}
+
+// Optimistic UI updates with rollback
+function applyOptimisticUpdate(updateFn, rollbackFn, mutation) {
+  // Apply immediately
+  updateFn();
+
+  // Queue for sync
+  queueMutation(mutation);
+
+  // If offline, show indicator
+  if (!isOnline) {
+    showToast('Change saved locally. Will sync when online.', false);
+  }
+}
+
+function rollbackOptimisticUpdate(rollbackFn) {
+  rollbackFn();
+  showToast('Change reverted due to sync failure', true);
+}
+
+// Cache data for offline access
+async function cacheData(key, data) {
+  if (swRegistration && swRegistration.active) {
+    swRegistration.active.postMessage({
+      type: 'set-cached-data',
+      key,
+      value: data,
+    });
+  }
+  // Also store in localStorage as fallback
+  try {
+    localStorage.setItem(`cached_${key}`, JSON.stringify({ data, timestamp: Date.now() }));
+  } catch (e) {
+    console.warn('Failed to cache data:', e);
+  }
+}
+
+async function getCachedData(key) {
+  // Try SW first
+  if (swRegistration && swRegistration.active) {
+    return new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = (event) => resolve(event.data.data);
+      swRegistration.active.postMessage(
+        { type: 'get-cached-data', key },
+        [channel.port2]
+      );
+      // Fallback timeout
+      setTimeout(() => resolve(null), 500);
+    });
+  }
+  // Fallback to localStorage
+  try {
+    const stored = localStorage.getItem(`cached_${key}`);
+    if (stored) {
+      return JSON.parse(stored).data;
+    }
+  } catch (e) {
+    console.warn('Failed to get cached data:', e);
+  }
+  return null;
+}
+
+// Initialize offline support
+function initOfflineSupport() {
+  registerServiceWorker();
+  setupOnlineOfflineHandlers();
+  loadPendingMutations();
+  updateStaleIndicator();
+}
+
+function showLoadingOverlay(message = "Loading…") {
+  const overlay = document.getElementById("loading-overlay");
+  const messageEl = document.getElementById("loading-message");
+  if (overlay && messageEl) {
+    messageEl.textContent = message;
+    overlay.classList.remove("hidden");
+    overlay.setAttribute("aria-busy", "true");
+  }
+}
+
+function hideLoadingOverlay() {
+  const overlay = document.getElementById("loading-overlay");
+  if (overlay) {
+    overlay.classList.add("hidden");
+    overlay.setAttribute("aria-busy", "false");
+  }
+  if (loadingOverlayTimer) {
+    clearTimeout(loadingOverlayTimer);
+    loadingOverlayTimer = null;
+  }
+}
+
+function showLoadingOverlayTimed(message = "Loading…", ms = 8000) {
+  showLoadingOverlay(message);
+  loadingOverlayTimer = setTimeout(hideLoadingOverlay, ms);
+}
+
+function showToast(message, isError = false, actions = []) {
+  const toast = document.getElementById("toast");
+  if (!toast) return;
+
+  const toastItem = { message, isError, actions, id: Date.now() };
+  toastQueue.push(toastItem);
+  processToastQueue();
+}
+
+function processToastQueue() {
+  if (isToastShowing || toastQueue.length === 0) return;
+  
+  const toast = document.getElementById("toast");
+  const item = toastQueue.shift();
+  if (!item) return;
+
+  isToastShowing = true;
+  toast.classList.toggle("error", item.isError);
+  toast.setAttribute("role", item.isError ? "alert" : "status");
+  toast.setAttribute("aria-live", item.isError ? "assertive" : "polite");
+  
+  let actionsHtml = "";
+  if (item.actions.length > 0) {
+    actionsHtml = `<div class="toast-actions">${item.actions.map(a => 
+      `<button class="button ${a.variant || "secondary"}" type="button" data-toast-action="${a.action}">${a.label}</button>`
+    ).join("")}</div>`;
+  }
+  
+  toast.innerHTML = `
+    <div class="toast-content">${escapeHtml(item.message)}</div>
+    ${actionsHtml}
+  `;
+  toast.hidden = false;
+
+  // Auto-hide after 5 seconds for non-error, 8 seconds for error
+  const hideDelay = item.isError ? 8000 : 5000;
+  setTimeout(() => {
+    toast.hidden = true;
+    isToastShowing = false;
+    processToastQueue();
+  }, hideDelay);
+}
+
+function showErrorWithRetry(message, retryAction, retryLabel = "Retry") {
+  showToast(message, true, [{ action: retryAction, label: retryLabel, variant: "secondary" }]);
+}
+
+function setButtonLoading(button, loading) {
+  if (!button) return;
+  if (loading) {
+    button.setAttribute("aria-busy", "true");
+    button.classList.add("loading");
+    button.disabled = true;
+  } else {
+    button.removeAttribute("aria-busy");
+    button.classList.remove("loading");
+    button.disabled = false;
+  }
+}
+
+function renderSkeletonCard(title = true, lines = 3) {
+  let html = '<div class="skeleton-card">';
+  if (title) {
+    html += '<div class="skeleton-card-header"><div class="skeleton skeleton-title"></div></div>';
+  }
+  html += '<div class="skeleton-card-body">';
+  for (let i = 0; i < lines; i++) {
+    html += '<div class="skeleton skeleton-text" style="width: ' + (80 + Math.random() * 20) + '%;"></div>';
+  }
+  html += '</div></div>';
+  return html;
+}
+
+function renderSkeletonBillItem() {
+  return `
+    <article class="skeleton-bill-item">
+      <div class="skeleton skeleton-text" style="width: 40%;"></div>
+      <div class="skeleton skeleton-text" style="width: 60%; margin-top: 8px;"></div>
+      <div class="skeleton skeleton-text" style="width: 30%; margin-top: 12px; height: 1.5rem;"></div>
+    </article>
+  `;
+}
+
+function renderSkeletonReportItem() {
+  return `
+    <article class="skeleton-report-item">
+      <div class="skeleton skeleton-text" style="width: 50%;"></div>
+      <div class="skeleton skeleton-text" style="width: 70%; margin-top: 8px;"></div>
+      <div class="skeleton skeleton-text" style="width: 80%; margin-top: 12px;"></div>
+    </article>
+  `;
+}
+
+function renderSkeletonQACard() {
+  return `
+    <article class="skeleton-qa-card">
+      <div class="skeleton skeleton-text" style="width: 30%;"></div>
+      <div class="skeleton skeleton-text" style="width: 90%; margin-top: 8px;"></div>
+      <div class="skeleton skeleton-text" style="width: 60%; margin-top: 8px;"></div>
+    </article>
+  `;
+}
+
+function renderErrorState(message, retryAction = null, retryLabel = "Try again") {
+  let retryHtml = "";
+  if (retryAction) {
+    retryHtml = `<button class="button" type="button" data-action="${retryAction}">${escapeHtml(retryLabel)}</button>`;
+  }
+  return `
+    <div class="error-state">
+      <div class="error-state-icon" aria-hidden="true">!</div>
+      <h3>Unable to load</h3>
+      <p>${escapeHtml(message)}</p>
+      ${retryHtml}
+    </div>
+  `;
+}
+
+function renderStaleIndicator(lastSync) {
+  if (!lastSync) return "";
+  const now = new Date();
+  const syncTime = new Date(lastSync);
+  const diffMinutes = Math.floor((now - syncTime) / 60000);
+  let label = "";
+  if (diffMinutes < 1) label = "Just now";
+  else if (diffMinutes < 60) label = `${diffMinutes}m ago`;
+  else if (diffMinutes < 1440) label = `${Math.floor(diffMinutes / 60)}h ago`;
+  else label = `${Math.floor(diffMinutes / 1440)}d ago`;
+  return `<span class="stale-indicator" title="Last updated ${label}"><span class="spinner spinner-sm" aria-hidden="true"></span>Data may be stale (${label})</span>`;
+}
+
+function updateStaleIndicator() {
+  const indicator = document.querySelector('.stale-indicator');
+  if (!indicator) return;
+  
+  const lastSync = localStorage.getItem('lastSyncTime');
+  if (!lastSync) {
+    indicator.remove();
+    return;
+  }
+  
+  const now = new Date();
+  const syncTime = new Date(lastSync);
+  const diffMinutes = Math.floor((now - syncTime) / 60000);
+  let label = "";
+  if (diffMinutes < 1) label = "Just now";
+  else if (diffMinutes < 60) label = `${diffMinutes}m ago`;
+  else if (diffMinutes < 1440) label = `${Math.floor(diffMinutes / 60)}h ago`;
+  else label = `${Math.floor(diffMinutes / 1440)}d ago`;
+  
+  indicator.title = `Last updated ${label}`;
+  indicator.innerHTML = `<span class="spinner spinner-sm" aria-hidden="true"></span>Data may be stale (${label})`;
+  
+  // Show/hide based on online status and time
+  if (!isOnline || diffMinutes > 30) {
+    indicator.style.display = 'inline-flex';
+  } else {
+    indicator.style.display = 'none';
+  }
+}
 
 const REPORT_STATUSES = [
   "Submitted",
@@ -412,7 +807,10 @@ function renderResident() {
   const navigation = residentNavigation();
   document.title = `${session.user.headName} · Barangay Connect`;
   document.getElementById("app").innerHTML =
-    `${topbar(session.user)}${portalNavigation(navigation, session.view)}<main id="main-content" class="page portal-page">${portalHeader("Resident portal", `Good morning, ${escapeHtml(household.headName.split(" ")[0])}.`, "A clear view of what needs your attention today.", `<div class="account-chip"><span class="avatar" aria-hidden="true">${initials(household.headName)}</span><div><span>Household account</span><strong>${escapeHtml(household.accountNumber)}</strong></div></div>`)}<div class="portal-grid"><div class="stack">${residentView(session.view)}</div><aside class="stack">${residentAside()}</aside></div></main>`;
+    `${topbar(session.user)}${portalNavigation(navigation, session.view)}<main id="main-content" class="page portal-page">${portalHeader("Resident portal", `Good morning, ${escapeHtml(household.headName.split(" ")[0])}.`, "A clear view of what needs your attention today.", `<div class="account-chip"><span class="avatar" aria-hidden="true">${initials(household.headName)}</span><div><span>Household account</span><strong>${escapeHtml(household.accountNumber)}</strong></div></div>${renderStaleIndicator(localStorage.getItem('lastSyncTime'))}`)}<div class="portal-grid"><div class="stack">${residentView(session.view)}</div><aside class="stack">${residentAside()}</aside></div></main>`;
+  
+  // Update stale indicator after render
+  updateStaleIndicator();
 }
 
 function residentView(view) {
@@ -484,7 +882,13 @@ function waterBillSummary(bills) {
   return `<section class="card" id="water-bills"><div class="card-header"><div><h2>Water billing</h2><p>Municipality-run utility · latest record first</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="bills">See all</button></div><div class="card-body"><div class="bills-list">${sorted.slice(0, 2).map(waterBillRow).join("") || '<p class="empty">No water bills available.</p>'}</div></div></section>`;
 }
 function waterBillRow(bill) {
-  return `<article class="bill-item"><div class="bill-top"><span class="bill-period">${escapeHtml(bill.period)}</span>${badge(effectiveBillStatus(bill))}</div><div class="bill-meta"><span>Consumption <strong>${escapeHtml(bill.consumption)} cu.m.</strong></span><span>Due ${dateLabel(bill.dueDate)}</span></div><div class="bill-amount">${money(bill.amountDue)}</div><button class="detail-toggle" type="button" data-action="toggle-detail" data-detail-id="water-${escapeHtml(bill.id)}" aria-expanded="false" aria-controls="water-${escapeHtml(bill.id)}-detail">Payment details</button><div class="detail-panel" id="water-${escapeHtml(bill.id)}-detail" hidden>Pay at the barangay treasury or through an official payment channel. This portal only reflects the status recorded by staff.</div></article>`;
+  const reminder = billReminder(bill);
+  const reminderClass = billReminderLevel(reminder.level);
+  const reminderBadge = reminder.level !== "none" && reminder.level !== "upcoming" 
+    ? `<span class="bill-reminder ${reminderClass}">${escapeHtml(reminder.message)}</span>`
+    : "";
+  
+  return `<article class="bill-item"><div class="bill-top"><span class="bill-period">${escapeHtml(bill.period)}</span>${badge(effectiveBillStatus(bill))}${reminderBadge}</div><div class="bill-meta"><span>Consumption <strong>${escapeHtml(bill.consumption)} cu.m.</strong></span><span>Due ${dateLabel(bill.dueDate)}</span></div><div class="bill-amount">${money(bill.amountDue)}</div><button class="detail-toggle" type="button" data-action="toggle-detail" data-detail-id="water-${escapeHtml(bill.id)}" aria-expanded="false" aria-controls="water-${escapeHtml(bill.id)}-detail">Payment details</button><div class="detail-panel" id="water-${escapeHtml(bill.id)}-detail" hidden>Pay at the barangay treasury or through an official payment channel. This portal only reflects the status recorded by staff.</div></article>`;
 }
 function taxSummary(taxes) {
   const tax = taxes[0];
@@ -494,10 +898,18 @@ function taxSummary(taxes) {
   return `<section class="card" id="property-tax"><div class="card-header"><div><h2>Property tax · ${tax.year}</h2><p>Annual assessment · due December 31</p></div>${badge(tax.status)}</div><div class="card-body"><div class="bill-top"><span class="bill-period">Assessed value ${money(tax.assessedValue)}</span><span class="muted" style="font-size:12px">2% annual rate</span></div><div class="tax-breakdown"><div class="tax-line"><span>Assessed value × 2%</span><strong>${money(calculation.base)}</strong></div>${calculation.discount ? `<div class="tax-line discount"><span>Early-payment discount (10%)</span><strong>− ${money(calculation.discount)}</strong></div>` : ""}${calculation.penalty ? `<div class="tax-line penalty"><span>Late-payment penalty</span><strong>+ ${money(calculation.penalty)}</strong></div>` : ""}<div class="tax-line total"><span>Amount currently due</span><strong>${money(calculation.total)}</strong></div></div><p class="muted" style="margin:15px 0 0;font-size:12px">A 10% discount is available through October 31. Payments after December 31 accrue a 2% monthly penalty.</p></div></section>`;
 }
 function renderAttention() {
-  const overdueWater = state.waterBills.filter(
-    (bill) =>
-      bill.householdId === session.user.id &&
-      effectiveBillStatus(bill) === "Overdue",
+  const householdBills = state.waterBills.filter(
+    (bill) => bill.householdId === session.user.id && bill.status !== "Paid",
+  );
+  const householdTaxes = state.propertyTaxes.filter(
+    (tax) => tax.householdId === session.user.id && tax.status !== "Paid",
+  );
+  
+  const overdueWater = householdBills.filter(
+    (bill) => billReminder(bill).level === "overdue",
+  );
+  const dueSoonWater = householdBills.filter(
+    (bill) => billReminder(bill).level === "due-soon" || billReminder(bill).level === "due-today",
   );
   const submitted = state.reports.filter(
     (report) =>
@@ -508,9 +920,34 @@ function renderAttention() {
   );
   const taxNeedsAction =
     tax && tax.status !== "Paid" && calculateTax(tax).total > 0;
-  if (!overdueWater.length && !submitted.length && !taxNeedsAction)
+  const taxReminder = tax ? billReminder(tax) : null;
+  
+  if (!overdueWater.length && !dueSoonWater.length && !submitted.length && !taxNeedsAction)
     return '<p class="empty">Nothing needs your attention right now.</p>';
-  return `<div class="list"><div class="list-row"><div class="list-row-main"><strong>Outstanding water balance</strong><p>${overdueWater.length} overdue record${overdueWater.length === 1 ? "" : "s"} · ${money(overdueWater.reduce((sum, bill) => sum + bill.amountDue, 0))}</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="bills">View</button></div><div class="list-row"><div class="list-row-main"><strong>Community reports</strong><p>${submitted.length} report${submitted.length === 1 ? "" : "s"} waiting for staff acknowledgement.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="reports">View</button></div><div class="list-row"><div class="list-row-main"><strong>Annual property tax</strong><p>${taxNeedsAction ? "Due December 31, 2026." : "No action needed."}</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="bills">View</button></div></div>`;
+  
+  let html = '<div class="list">';
+  
+  if (overdueWater.length) {
+    html += `<div class="list-row"><div class="list-row-main"><strong>Overdue water bills</strong><p>${overdueWater.length} overdue record${overdueWater.length === 1 ? "" : "s"} · ${money(overdueWater.reduce((sum, bill) => sum + bill.amountDue, 0))}</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="bills">View</button></div>`;
+  }
+  
+  if (dueSoonWater.length) {
+    html += `<div class="list-row"><div class="list-row-main"><strong>Water bills due soon</strong><p>${dueSoonWater.length} record${dueSoonWater.length === 1 ? "" : "s"} due within 7 days · ${money(dueSoonWater.reduce((sum, bill) => sum + bill.amountDue, 0))}</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="bills">View</button></div>`;
+  }
+  
+  if (submitted.length) {
+    html += `<div class="list-row"><div class="list-row-main"><strong>Community reports</strong><p>${submitted.length} report${submitted.length === 1 ? "" : "s"} waiting for staff acknowledgement.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="reports">View</button></div>`;
+  }
+  
+  if (taxNeedsAction) {
+    const taxMsg = taxReminder && taxReminder.level !== "none" 
+      ? taxReminder.message 
+      : "Due December 31, 2026.";
+    html += `<div class="list-row"><div class="list-row-main"><strong>Annual property tax</strong><p>${taxMsg}</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="bills">View</button></div>`;
+  }
+  
+  html += '</div>';
+  return html;
 }
 function renderResidentReports(reports) {
   if (!reports.length)
@@ -634,6 +1071,9 @@ function renderStaff() {
   document.title = "Staff console · Barangay Connect";
   document.getElementById("app").innerHTML =
     `${topbar(session.user)}${portalNavigation(navigation, session.view)}<main id="main-content" class="page admin-page"><div class="admin-header"><div class="admin-header-row"><div><p class="eyebrow">Staff workspace · ${escapeHtml(session.user.office)}</p><h1 class="display-title">Barangay operations</h1><p>A focused view of resident concerns and payment records.</p></div><span class="admin-badge">Staff access</span></div></div><div class="admin-grid">${staffView(session.view)}</div></main>`;
+  
+  // Update stale indicator after render
+  updateStaleIndicator();
 }
 function staffView(view) {
   if (view === "queue") return renderReportQueue();
@@ -688,28 +1128,33 @@ function renderReportRows(filter) {
   if (!visible.length)
     return '<tr><td class="table-empty" colspan="5">No reports match this filter.</td></tr>';
   return visible
-    .map((report) => {
+    .map((report, index) => {
       const household = householdFor(report.householdId);
-      return `<tr><td><strong>${escapeHtml(report.title)}</strong><span class="cell-secondary">${escapeHtml(report.location)}</span></td><td>${escapeHtml(report.category)}</td><td>${escapeHtml(household?.headName || "Unknown")}</td><td>${dateLabel(report.createdAt)}</td><td><select class="status-control status-${statusTone(report.status)}" data-report-status="${escapeHtml(report.id)}" aria-label="Status for ${escapeHtml(report.title)}">${REPORT_STATUSES.map((status) => `<option ${status === report.status ? "selected" : ""}>${status}</option>`).join("")}</select></td></tr>`;
+      return `<tr data-report-id="${escapeHtml(report.id)}" data-report-index="${index}"><td><strong>${escapeHtml(report.title)}</strong><span class="cell-secondary">${escapeHtml(report.location)}</span></td><td>${escapeHtml(report.category)}</td><td>${escapeHtml(household?.headName || "Unknown")}</td><td>${dateLabel(report.createdAt)}</td><td><select class="status-control status-${statusTone(report.status)}" data-report-status="${escapeHtml(report.id)}" aria-label="Status for ${escapeHtml(report.title)}">${REPORT_STATUSES.map((status) => `<option ${status === report.status ? "selected" : ""}>${status}</option>`).join("")}</select></td></tr>`;
     })
     .join("");
 }
 function renderBillingRecords() {
-  const records = outstandingBillingRecords(state);
-  return `<section class="card" id="billing-records"><div class="card-header"><div><h2>Billing records</h2><p>Mark a record paid after confirming payment received elsewhere.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="home">Back to overview</button></div><div class="toolbar"><span class="toolbar-label">${records.length} outstanding record${records.length === 1 ? "" : "s"}</span><div></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Household</th><th>Type</th><th>Period</th><th>Amount due</th><th>Status</th><th>Update status</th></tr></thead><tbody>${renderBillingRows(records)}</tbody></table></div></section>`;
+  const records = outstandingBillingRecordsWithReminders(state);
+  return `<section class="card" id="billing-records"><div class="card-header"><div><h2>Billing records</h2><p>Mark a record paid after confirming payment received elsewhere.</p></div><button class="button secondary compact" type="button" data-action="navigate" data-view="home">Back to overview</button></div><div class="toolbar"><span class="toolbar-label">${records.length} outstanding record${records.length === 1 ? "" : "s"}</span><div></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Household</th><th>Type</th><th>Period</th><th>Amount due</th><th>Status</th><th>Reminder</th><th>Update status</th></tr></thead><tbody>${renderBillingRows(records)}</tbody></table></div></section>`;
 }
 function renderBillingRows(records) {
   if (!records.length)
-    return '<tr><td class="table-empty" colspan="6">All billing records are marked paid.</td></tr>';
+    return '<tr><td class="table-empty" colspan="7">All billing records are marked paid.</td></tr>';
   return records
-    .map(({ type, record }) => {
+    .map(({ type, record }, index) => {
       const household = householdFor(record.householdId);
       const isWater = type === "water";
       const label = isWater ? record.period : `${record.year} annual tax`;
       const dueDate = isWater ? record.dueDate : record.dueDate;
       const status = isWater ? effectiveBillStatus(record) : "Unpaid";
       const amount = isWater ? record.amountDue : calculateTax(record).total;
-      return `<tr><td><strong>${escapeHtml(household?.headName || "Unknown")}</strong><span class="cell-secondary">${escapeHtml(household?.accountNumber || "")} · ${escapeHtml(household?.address || "")}</span></td><td>${isWater ? "Water" : "Property tax"}</td><td>${escapeHtml(label)}<span class="cell-secondary">Due ${dateLabel(dueDate)}</span></td><td><strong>${money(amount)}</strong></td><td>${badge(status)}</td><td><button class="table-action" type="button" data-payment-type="${type}" data-payment-id="${escapeHtml(record.id)}" data-confirm="Mark this ${isWater ? "water" : "property tax"} record as paid?">Mark paid</button></td></tr>`;
+      const reminder = billReminder(record);
+      const reminderClass = billReminderLevel(reminder.level);
+      const reminderBadge = reminder.level !== "none" && reminder.level !== "upcoming" 
+        ? `<span class="bill-reminder ${reminderClass}">${escapeHtml(reminder.message)}</span>`
+        : "";
+      return `<tr data-payment-id="${escapeHtml(record.id)}" data-payment-index="${index}"><td><strong>${escapeHtml(household?.headName || "Unknown")}</strong><span class="cell-secondary">${escapeHtml(household?.accountNumber || "")} · ${escapeHtml(household?.address || "")}</span></td><td>${isWater ? "Water" : "Property tax"}</td><td>${escapeHtml(label)}<span class="cell-secondary">Due ${dateLabel(dueDate)}</span></td><td><strong>${money(amount)}</strong></td><td>${badge(status)}</td><td>${reminderBadge}</td><td><button class="table-action" type="button" data-payment-type="${type}" data-payment-id="${escapeHtml(record.id)}" data-confirm="Mark this ${isWater ? "water" : "property tax"} record as paid?">Mark paid</button></td></tr>`;
     })
     .join("");
 }
@@ -734,6 +1179,18 @@ const app = document.getElementById("app");
 app.addEventListener("click", (event) => {
   if (isResident()) handleResidentClick(event);
   else if (isStaff()) handleStaffClick(event);
+  
+  // Handle toast action buttons
+  if (event.target.matches('[data-toast-action]')) {
+    const action = event.target.dataset.toastAction;
+    if (action === "retry-submit-issue") {
+      const form = document.getElementById("issue-form");
+      if (form) form.dispatchEvent(new Event("submit"));
+    } else if (action === "retry-submit-question") {
+      const form = document.getElementById("qa-form");
+      if (form) form.dispatchEvent(new Event("submit"));
+    }
+  }
 });
 app.addEventListener("change", (event) => {
   if (isResident()) handleResidentChange(event);
@@ -743,6 +1200,109 @@ app.addEventListener("submit", (event) => {
   if (isResident()) handleResidentSubmit(event);
   else if (isStaff()) handleStaffSubmit(event);
 });
+
+// Keyboard shortcuts for staff
+document.addEventListener("keydown", (event) => {
+  console.log('Keydown event:', event.key, 'isStaff:', isStaff());
+  if (!isStaff()) return;
+  
+  // Don't trigger shortcuts when typing in inputs
+  const target = event.target;
+  if (target instanceof HTMLElement && target.matches("input, textarea, select")) return;
+  
+  const key = event.key.toLowerCase();
+  
+  // Navigation shortcuts (j/k work on whichever table is visible)
+  if (key === "j") {
+    event.preventDefault();
+    if (document.querySelector('#report-queue tbody tr[data-report-id]')) {
+      navigateReportQueue(1);
+    } else if (document.querySelector('#billing-records tbody tr[data-payment-id]')) {
+      navigateBillingRecords(1);
+    }
+  } else if (key === "k") {
+    event.preventDefault();
+    if (document.querySelector('#report-queue tbody tr[data-report-id]')) {
+      navigateReportQueue(-1);
+    } else if (document.querySelector('#billing-records tbody tr[data-payment-id]')) {
+      navigateBillingRecords(-1);
+    }
+  }
+  
+  // Status shortcuts (1-4) - only for report queue
+  if (["1", "2", "3", "4"].includes(key)) {
+    event.preventDefault();
+    const statusIndex = parseInt(key) - 1;
+    if (statusIndex < REPORT_STATUSES.length) {
+      changeSelectedReportStatus(REPORT_STATUSES[statusIndex]);
+    }
+  }
+  
+  // Mark paid shortcut (m) - only for billing records
+  if (key === "m") {
+    event.preventDefault();
+    markSelectedBillingPaid();
+  }
+  
+  // Focus search
+  if (key === "/") {
+    event.preventDefault();
+    const filterSelect = document.querySelector('[data-action="report-filter"]');
+    if (filterSelect) filterSelect.focus();
+  }
+});
+
+let selectedReportIndex = -1;
+let selectedBillingIndex = -1;
+
+function navigateReportQueue(direction) {
+  const rows = document.querySelectorAll('#report-queue tbody tr[data-report-id]');
+  if (rows.length === 0) return;
+  
+  selectedReportIndex = Math.max(0, Math.min(rows.length - 1, selectedReportIndex + direction));
+  rows.forEach((row, i) => {
+    row.classList.toggle('selected', i === selectedReportIndex);
+  });
+  if (rows[selectedReportIndex]) {
+    rows[selectedReportIndex].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
+
+function navigateBillingRecords(direction) {
+  const rows = document.querySelectorAll('#billing-records tbody tr[data-payment-id]');
+  if (rows.length === 0) return;
+  
+  selectedBillingIndex = Math.max(0, Math.min(rows.length - 1, selectedBillingIndex + direction));
+  rows.forEach((row, i) => {
+    row.classList.toggle('selected', i === selectedBillingIndex);
+  });
+  if (rows[selectedBillingIndex]) {
+    rows[selectedBillingIndex].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
+
+function changeSelectedReportStatus(status) {
+  if (selectedReportIndex < 0) return;
+  const rows = document.querySelectorAll('#report-queue tbody tr[data-report-id]');
+  const row = rows[selectedReportIndex];
+  if (!row) return;
+  
+  const select = row.querySelector('[data-report-status]');
+  if (select) {
+    select.value = status;
+    select.dispatchEvent(new Event('change'));
+  }
+}
+
+function markSelectedBillingPaid() {
+  if (selectedBillingIndex < 0) return;
+  const rows = document.querySelectorAll('#billing-records tbody tr[data-payment-id]');
+  const row = rows[selectedBillingIndex];
+  if (!row) return;
+  
+  const button = row.querySelector('[data-payment-type]');
+  if (button) button.click();
+}
 function handleResidentClick(event) {
   const button = event.target.closest?.("[data-action]");
   if (!button) return;
@@ -896,6 +1456,9 @@ function handleResidentSubmit(event) {
 async function submitIssue(event) {
   event.preventDefault();
   const form = event.target;
+  const submitBtn = form.querySelector('button[type="submit"]');
+  setButtonLoading(submitBtn, true);
+  
   const formData = new FormData(form);
   const values = Object.fromEntries(formData);
   if (
@@ -905,6 +1468,7 @@ async function submitIssue(event) {
     !values.category
   ) {
     showFormError("report-error", "Please complete each required field.");
+    setButtonLoading(submitBtn, false);
     return;
   }
   
@@ -939,9 +1503,33 @@ async function submitIssue(event) {
     updatedAt: AS_OF_DATE,
     images: images,
   };
-  if (!commitState({ ...state, reports: [report, ...state.reports] })) return;
-  renderResident();
-  showToast("Report submitted. You can follow its status here.");
+  
+  // Optimistic update with offline support
+  const nextState = { ...state, reports: [report, ...state.reports] };
+  
+  applyOptimisticUpdate(
+    () => {
+      if (!commitState(nextState)) {
+        setButtonLoading(submitBtn, false);
+        return false;
+      }
+      renderResident();
+      showToast("Report submitted. You can follow its status here.");
+      return true;
+    },
+    () => {
+      // Rollback - just re-render
+      renderResident();
+    },
+    {
+      url: '/api/reports', // Would be actual API endpoint
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report),
+    }
+  );
+  
+  setButtonLoading(submitBtn, false);
 }
 
 function fileToBase64(file) {
@@ -955,9 +1543,13 @@ function fileToBase64(file) {
 function submitQuestion(event) {
   event.preventDefault();
   const form = event.target;
+  const submitBtn = form.querySelector('button[type="submit"]');
+  setButtonLoading(submitBtn, true);
+  
   const question = new FormData(form).get("question")?.toString().trim();
   if (!question) {
     showFormError("question-error", "Please write your question first.");
+    setButtonLoading(submitBtn, false);
     return;
   }
   const newQuestion = {
@@ -969,10 +1561,33 @@ function submitQuestion(event) {
     upvotes: 0,
     createdAt: AS_OF_DATE,
   };
-  if (!commitState({ ...state, questions: [newQuestion, ...state.questions] }))
-    return;
-  renderResident();
-  showToast("Question posted for the barangay team.");
+  
+  // Optimistic update with offline support
+  const nextState = { ...state, questions: [newQuestion, ...state.questions] };
+  
+  applyOptimisticUpdate(
+    () => {
+      if (!commitState(nextState)) {
+        setButtonLoading(submitBtn, false);
+        return false;
+      }
+      renderResident();
+      showToast("Question posted for the barangay team.");
+      return true;
+    },
+    () => {
+      // Rollback - just re-render
+      renderResident();
+    },
+    {
+      url: '/api/questions',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newQuestion),
+    }
+  );
+  
+  setButtonLoading(submitBtn, false);
 }
 function handleStaffClick(event) {
   const button = event.target.closest?.("[data-action]");
@@ -988,23 +1603,43 @@ function handleStaffClick(event) {
   const paymentButton = event.target.closest?.("[data-payment-type]");
   if (paymentButton) {
     if (!window.confirm(paymentButton.dataset.confirm)) return;
+    setButtonLoading(paymentButton, true);
     const type = paymentButton.dataset.paymentType;
+    const paymentId = paymentButton.dataset.paymentId;
     let nextState;
     try {
-      nextState = markBillingRecordPaid(
-        state,
-        type,
-        paymentButton.dataset.paymentId,
-        AS_OF_DATE,
-      );
+      nextState = markBillingRecordPaid(state, type, paymentId, AS_OF_DATE);
     } catch (error) {
       console.error(error);
       showToast("Could not update this billing record.", true);
+      setButtonLoading(paymentButton, false);
       return;
     }
-    if (!commitState(nextState)) return;
-    renderStaff();
-    showToast(`${type === "water" ? "Water" : "Tax"} record marked as paid.`);
+    
+    // Optimistic update with offline support
+    applyOptimisticUpdate(
+      () => {
+        if (!commitState(nextState)) {
+          setButtonLoading(paymentButton, false);
+          return false;
+        }
+        renderStaff();
+        showToast(`${type === "water" ? "Water" : "Tax"} record marked as paid.`);
+        return true;
+      },
+      () => {
+        // Rollback
+        renderStaff();
+      },
+      {
+        url: `/api/billing/${type}/${paymentId}/paid`,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paidAt: AS_OF_DATE }),
+      }
+    );
+    
+    setButtonLoading(paymentButton, false);
   }
 }
 function handleStaffChange(event) {
@@ -1014,14 +1649,44 @@ function handleStaffChange(event) {
       (item) => item.id === select.dataset.reportStatus,
     );
     if (report) {
+      const oldStatus = report.status;
+      const newStatus = select.value;
+      
+      // Show loading state on the select
+      select.disabled = true;
       const reports = state.reports.map((item) =>
         item.id === report.id
-          ? { ...item, status: select.value, updatedAt: AS_OF_DATE }
+          ? { ...item, status: newStatus, updatedAt: AS_OF_DATE }
           : item,
       );
-      if (!commitState({ ...state, reports })) return;
-      renderStaff();
-      showToast(`Report moved to ${select.value}.`);
+      
+      // Optimistic update with offline support
+      applyOptimisticUpdate(
+        () => {
+          if (!commitState({ ...state, reports })) {
+            select.disabled = false;
+            select.value = oldStatus;
+            return false;
+          }
+          renderStaff();
+          showToast(`Report moved to ${newStatus}.`);
+          return true;
+        },
+        () => {
+          // Rollback
+          select.disabled = false;
+          select.value = oldStatus;
+          renderStaff();
+        },
+        {
+          url: `/api/reports/${report.id}/status`,
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: newStatus, updatedAt: AS_OF_DATE }),
+        }
+      );
+      
+      select.disabled = false;
     }
     return;
   }
@@ -1058,24 +1723,15 @@ function showFormError(id, message) {
 function commitState(nextState) {
   try {
     state = stateStore.commit(nextState);
+    // Update last sync time
+    localStorage.setItem('lastSyncTime', new Date().toISOString());
+    updateStaleIndicator();
     return true;
   } catch (error) {
     console.error(error);
     showToast("Unable to save changes. Your previous data is unchanged.", true);
     return false;
   }
-}
-function showToast(message, isError = false) {
-  clearTimeout(toastTimer);
-  const element = document.getElementById("toast");
-  element.textContent = message;
-  element.classList.toggle("error", isError);
-  element.setAttribute("role", isError ? "alert" : "status");
-  element.setAttribute("aria-live", isError ? "assertive" : "polite");
-  element.hidden = false;
-  toastTimer = setTimeout(() => {
-    element.hidden = true;
-  }, 3600);
 }
 
 function renderStateError() {
@@ -1086,6 +1742,8 @@ function renderStateError() {
 try {
   state = stateStore.load();
   renderLogin();
+  // Initialize offline support after state is loaded
+  initOfflineSupport();
 } catch (error) {
   console.error(error);
   renderStateError();
