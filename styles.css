@@ -157,11 +157,38 @@ a {
   text-transform: uppercase;
 }
 .topbar-meta {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 16px;
   color: var(--muted);
   font-size: 13px;
+}
+.app-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  min-width: 144px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.app-menu-item {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: 14px;
+}
+.app-menu-item:hover {
+  background: var(--surface-soft);
+  color: var(--green-dark);
 }
 .topbar-user {
   display: flex;

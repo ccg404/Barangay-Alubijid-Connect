@@ -715,23 +715,38 @@ function badge(status) {
   return `<span class="status status-${statusTone(status)}">${escapeHtml(status)}</span>`;
 }
 
+function appMenuMarkup() {
+  return `<div class="app-menu" id="app-menu" hidden><button class="app-menu-item" type="button" data-action="logout">Sign out</button></div>`;
+}
+
+function setAppMenuOpen(isOpen, returnFocus = false) {
+  const menu = document.getElementById("app-menu");
+  const trigger = document.querySelector('[data-action="open-menu"]');
+  if (!menu || !trigger) return;
+
+  menu.hidden = !isOpen;
+  trigger.setAttribute("aria-expanded", String(isOpen));
+  if (isOpen) menu.querySelector("button")?.focus();
+  else if (returnFocus) trigger.focus();
+}
+
 function topbar(user) {
   return `<header class="topbar"><div class="page topbar-inner">
     <a class="brand" href="#main-content" aria-label="Barangay Connect home"><span class="brand-mark" aria-hidden="true">b</span><span><span class="brand-name">Barangay Alubijid Connect</span><span class="brand-caption">Your barangay, closer</span></span></a>
-    <div class="topbar-meta">${user ? `<span class="topbar-user"><span class="avatar" aria-hidden="true">${initials(user.role === "staff" ? user.name : user.headName)}</span><span>${escapeHtml(user.role === "staff" ? user.name : user.headName)}</span></span><button class="link-button" type="button" data-action="logout">Sign out</button>` : "<span>Official resident services</span>"}</div>
+    <div class="topbar-meta">${user ? `<span class="topbar-user"><span class="avatar" aria-hidden="true">${initials(user.role === "staff" ? user.name : user.headName)}</span><span>${escapeHtml(user.role === "staff" ? user.name : user.headName)}</span></span><button class="icon-button" type="button" data-action="open-menu" aria-label="Open menu" aria-expanded="false" aria-controls="app-menu"><span aria-hidden="true">☰</span></button>${appMenuMarkup()}` : "<span>Official resident services</span>"}</div>
   </div></header>`;
 }
 
 function renderLogin() {
   document.title = "Sign in · Barangay Connect";
-  document.getElementById("app").innerHTML = `<div class="login-page">
+  document.getElementById("app").innerHTML = `<main id="main-content" class="login-page" tabindex="-1">
     <section class="login-intro"><div><p class="eyebrow">Barangay services · resident portal</p><h1 class="display-title">Your concerns,<br>closer to home.</h1><p class="login-intro-copy">Check your bills, follow community reports, and get clear answers from the people who serve your barangay.</p><div class="intro-rule"></div><p class="intro-note">Portal access is created at the barangay hall after residency verification. Payments are made through official channels outside this portal.</p></div><span class="intro-mark" aria-hidden="true">✳</span></section>
     <section class="login-panel"><div class="login-card"><p class="eyebrow">Welcome back</p><h2>Sign in to your account</h2><p>Use your household account number and password.</p><form id="login-form" class="form-stack" novalidate>
       <div class="field"><label for="account-input">Account number</label><input id="account-input" name="account" autocomplete="username" placeholder="0000-0000" required></div>
       <div class="field"><label for="password-input">Password</label><input id="password-input" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required></div>
       <p id="login-error" class="form-error" role="alert" hidden></p><button class="button" type="submit">Sign in</button>
     </form><div class="demo-box"><p>Portfolio demo accounts</p><div class="demo-row"><span>Resident</span><code>0231-4470 / resident123</code></div><div class="demo-row"><span>Staff</span><code>staff / staff123</code></div></div></div></section>
-  </div>`;
+  </main>`;
   document.getElementById("login-form").addEventListener("submit", handleLogin);
 }
 
@@ -807,7 +822,7 @@ function renderResident() {
   const navigation = residentNavigation();
   document.title = `${session.user.headName} · Barangay Connect`;
   document.getElementById("app").innerHTML =
-    `${topbar(session.user)}${portalNavigation(navigation, session.view)}<main id="main-content" class="page portal-page">${portalHeader("Resident portal", `Good morning, ${escapeHtml(household.headName.split(" ")[0])}.`, "A clear view of what needs your attention today.", `<div class="account-chip"><span class="avatar" aria-hidden="true">${initials(household.headName)}</span><div><span>Household account</span><strong>${escapeHtml(household.accountNumber)}</strong></div></div>${renderStaleIndicator(localStorage.getItem('lastSyncTime'))}`)}<div class="portal-grid"><div class="stack">${residentView(session.view)}</div><aside class="stack">${residentAside()}</aside></div></main>`;
+      `${topbar(session.user)}${portalNavigation(navigation, session.view)}<main id="main-content" class="page portal-page">${portalHeader("Resident portal", `Good morning, ${escapeHtml(household.headName.split(" ")[0])}.`, "A clear view of what needs your attention today.", `<div class="account-chip"><span class="avatar" aria-hidden="true">${initials(household.headName)}</span><div><span>Household account</span><strong>${escapeHtml(household.accountNumber)}</strong></div></div>${renderStaleIndicator(localStorage.getItem('lastSyncTime'))}`)}<div class="portal-grid"><div class="stack">${residentView(session.view)}</div><aside class="stack">${residentAside()}</aside></div></main>`;
   
   // Update stale indicator after render
   updateStaleIndicator();
@@ -1177,6 +1192,14 @@ function portalNavigation(navigation, currentView) {
 }
 const app = document.getElementById("app");
 app.addEventListener("click", (event) => {
+  const menuButton = event.target.closest?.('[data-action="open-menu"]');
+  if (menuButton) {
+    const menu = document.getElementById("app-menu");
+    if (menu) setAppMenuOpen(menu.hidden);
+    return;
+  }
+  if (!event.target.closest?.("#app-menu")) setAppMenuOpen(false);
+
   if (isResident()) handleResidentClick(event);
   else if (isStaff()) handleStaffClick(event);
   
@@ -1203,6 +1226,13 @@ app.addEventListener("submit", (event) => {
 
 // Keyboard shortcuts for staff
 document.addEventListener("keydown", (event) => {
+  const menu = document.getElementById("app-menu");
+  if (event.key === "Escape" && menu && !menu.hidden) {
+    event.preventDefault();
+    setAppMenuOpen(false, true);
+    return;
+  }
+
   console.log('Keydown event:', event.key, 'isStaff:', isStaff());
   if (!isStaff()) return;
   

@@ -3,10 +3,11 @@
  * Provides offline caching and background sync for mutations
  */
 
-const CACHE_NAME = 'barangay-connect-v1';
+const CACHE_NAME = 'barangay-connect-v2';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
+  '/favicon.svg',
   '/styles.css',
   '/script.js',
   '/portal-state.mjs',
@@ -14,8 +15,8 @@ const STATIC_ASSETS = [
 ];
 
 const CACHE_STRATEGIES = {
-  // Cache first for static assets
-  static: 'cache-first',
+  // Refresh static assets when online, with a cached fallback.
+  static: 'network-first',
   // Network first for API/data requests
   data: 'network-first',
   // Stale while revalidate for HTML
